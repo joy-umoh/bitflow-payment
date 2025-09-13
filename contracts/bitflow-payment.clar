@@ -280,3 +280,143 @@
     )
   )
 )
+
+;; DISPUTE RESOLUTION & UNILATERAL CLOSURE
+
+(define-public (initiate-unilateral-close
+    (channel-id (buff 32))
+    (participant-b principal)
+    (proposed-balance-a uint)
+    (proposed-balance-b uint)
+    (signature (buff 65))
+  )
+  ;; Initiates contested channel closure with Bitcoin-style time lock arbitration
+  (let (
+      (channel (unwrap!
+        (map-get? payment-channels {
+          channel-id: channel-id,
+          participant-a: tx-sender,
+          participant-b: participant-b,
+        })
+        ERR-CHANNEL-NOT-FOUND
+      ))
+      (total-channel-funds (get total-deposited channel))
+    )
+    ;; Enhanced input validation - this addresses warning 4
+    (asserts! (is-valid-channel-id channel-id) ERR-INVALID-INPUT)
+    (asserts! (is-valid-participant participant-b) ERR-INVALID-INPUT)
+    (asserts! (not (is-eq tx-sender participant-b)) ERR-INVALID-INPUT)
+    (asserts! (get is-open channel) ERR-CHANNEL-CLOSED)
+
+    ;; Validate proposed balances
+    (asserts!
+      (is-valid-balance-pair proposed-balance-a proposed-balance-b
+        total-channel-funds
+      )
+      ERR-INVALID-BALANCE
+    )
+
+    ;; Create message and verify signature after validation
+    (let ((message (concat (concat channel-id (uint-to-buff proposed-balance-a))
+        (uint-to-buff proposed-balance-b)
+      )))
+      ;; Channel state and signature validation
+      (asserts! (verify-signature message signature tx-sender)
+        ERR-INVALID-SIGNATURE
+      )
+
+      ;; Implement Bitcoin-style 144-block dispute period (~24 hours)
+      ;; Allows counterparty to challenge fraudulent closure attempts
+      (map-set payment-channels {
+        channel-id: channel-id,
+        participant-a: tx-sender,
+        participant-b: participant-b,
+      }
+        (merge channel {
+          dispute-deadline: (+ stacks-block-height u144),
+          balance-a: proposed-balance-a,
+          balance-b: proposed-balance-b,
+        })
+      )
+
+      (ok true)
+    )
+  )
+)
+
+(define-public (resolve-unilateral-close
+    (channel-id (buff 32))
+    (participant-b principal)
+  )
+  ;; Finalizes unilateral channel closure after dispute period expiration
+  (let (
+      (channel (unwrap!
+        (map-get? payment-channels {
+          channel-id: channel-id,
+          participant-a: tx-sender,
+          participant-b: participant-b,
+        })
+        ERR-CHANNEL-NOT-FOUND
+      ))
+      (proposed-balance-a (get balance-a channel))
+      (proposed-balance-b (get balance-b channel))
+    )
+    ;; Input and timing validation
+    (asserts! (is-valid-channel-id channel-id) ERR-INVALID-INPUT)
+    (asserts! (not (is-eq tx-sender participant-b)) ERR-INVALID-INPUT)
+    (asserts! (is-valid-participant participant-b) ERR-INVALID-INPUT)
+
+    ;; Ensure Bitcoin-style time lock has expired
+    (asserts! (>= stacks-block-height (get dispute-deadline channel))
+      ERR-DISPUTE-PERIOD
+    )
+
+    ;; Execute final settlement based on disputed balances
+    (try! (as-contract (stx-transfer? proposed-balance-a tx-sender tx-sender)))
+    (try! (as-contract (stx-transfer? proposed-balance-b tx-sender participant-b)))
+
+    ;; Archive channel with complete state reset
+    (map-set payment-channels {
+      channel-id: channel-id,
+      participant-a: tx-sender,
+      participant-b: participant-b,
+    }
+      (merge channel {
+        is-open: false,
+        balance-a: u0,
+        balance-b: u0,
+        total-deposited: u0,
+      })
+    )
+
+    (ok true)
+  )
+)
+
+;; LIGHTNING NETWORK INTEROPERABILITY LAYER
+
+(define-read-only (get-channel-info
+    (channel-id (buff 32))
+    (participant-a principal)
+    (participant-b principal)
+  )
+  ;; Retrieves comprehensive channel state in Lightning Network compatible format
+  (map-get? payment-channels {
+    channel-id: channel-id,
+    participant-a: participant-a,
+    participant-b: participant-b,
+  })
+)
+
+;; EMERGENCY SAFEGUARDS & GOVERNANCE
+
+(define-public (emergency-withdraw)
+  ;; Contract owner emergency function for critical security scenarios
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (try! (stx-transfer? (stx-get-balance (as-contract tx-sender))
+      (as-contract tx-sender) CONTRACT-OWNER
+    ))
+    (ok true)
+  )
+)
